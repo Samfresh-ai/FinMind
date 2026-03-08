@@ -90,3 +90,52 @@ def test_budget_suggestion_falls_back_when_gemini_fails(
     assert payload["method"] == "heuristic"
     assert "warnings" in payload
     assert "gemini_unavailable" in payload["warnings"]
+
+
+def test_weekly_digest_returns_summary_and_categories(client, auth_header):
+    current = date.today()
+    current_in_window = current - timedelta(days=1)
+    previous_in_window = current - timedelta(days=9)
+
+    r = client.post(
+        "/expenses",
+        json={
+            "amount": 120,
+            "description": "Groceries current week",
+            "date": current_in_window.isoformat(),
+            "expense_type": "EXPENSE",
+        },
+        headers=auth_header,
+    )
+    assert r.status_code == 201
+
+    r = client.post(
+        "/expenses",
+        json={
+            "amount": 60,
+            "description": "Groceries previous week",
+            "date": previous_in_window.isoformat(),
+            "expense_type": "EXPENSE",
+        },
+        headers=auth_header,
+    )
+    assert r.status_code == 201
+
+    r = client.get("/insights/weekly-digest", headers=auth_header)
+    assert r.status_code == 200
+    payload = r.get_json()
+
+    assert "period" in payload
+    assert "summary" in payload
+    assert "categories" in payload
+    assert "insights" in payload
+    assert payload["summary"]["current_total"] >= 120
+    assert payload["summary"]["previous_total"] >= 60
+    assert isinstance(payload["categories"], list)
+
+
+def test_weekly_digest_rejects_invalid_end_date(client, auth_header):
+    r = client.get("/insights/weekly-digest?end_date=bad-date", headers=auth_header)
+    assert r.status_code == 400
+    payload = r.get_json()
+    assert payload["error"] == "invalid end_date"
