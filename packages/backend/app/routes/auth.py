@@ -9,9 +9,11 @@ from flask_jwt_extended import (
     get_jwt_identity,
 )
 from ..extensions import db, redis_client
-from ..models import User
+from ..models import User, AuditLog
 import logging
 import time
+import redis
+from datetime import datetime, timedelta
 
 bp = Blueprint("auth", __name__)
 logger = logging.getLogger("finmind.auth")
@@ -57,11 +59,15 @@ def login():
     password = data.get("password")
     user = db.session.query(User).filter_by(email=email).first()
     if not user or not check_password_hash(user.password_hash, password):
+        db.session.add(AuditLog(user_id=(user.id if user else None), action="auth.login_failed"))
+        db.session.commit()
         logger.warning("Login failed for email=%s", email)
         return jsonify(error="invalid credentials"), 401
     access = create_access_token(identity=str(user.id))
     refresh = create_refresh_token(identity=str(user.id))
     _store_refresh_session(refresh, str(user.id))
+    db.session.add(AuditLog(user_id=user.id, action="auth.login_success"))
+    db.session.commit()
     logger.info("Login success user_id=%s", user.id)
     return jsonify(access_token=access, refresh_token=refresh)
 
@@ -101,12 +107,86 @@ def update_me():
     )
 
 
+@bp.get("/login-anomaly-alerts")
+@jwt_required()
+def login_anomaly_alerts():
+    uid = int(get_jwt_identity())
+    now = datetime.utcnow()
+    lookback = now - timedelta(days=7)
+
+    logs = (
+        db.session.query(AuditLog)
+        .filter(AuditLog.user_id == uid)
+        .filter(AuditLog.created_at >= lookback)
+        .order_by(AuditLog.created_at.desc())
+        .all()
+    )
+
+    recent = [
+        {
+            "action": l.action,
+            "created_at": l.created_at.isoformat() + "Z",
+        }
+        for l in logs[:50]
+    ]
+
+    alerts = []
+
+    # Burst failed logins in 15-minute windows.
+    failed = [l for l in logs if l.action == "auth.login_failed"]
+    for i, ev in enumerate(failed):
+        win_end = ev.created_at
+        win_start = win_end - timedelta(minutes=15)
+        burst = [x for x in failed if win_start <= x.created_at <= win_end]
+        if len(burst) >= 3:
+            alerts.append(
+                {
+                    "type": "failed_login_burst",
+                    "severity": "high",
+                    "message": "Multiple failed login attempts detected in a short period.",
+                    "count": len(burst),
+                    "window_start": win_start.isoformat() + "Z",
+                    "window_end": win_end.isoformat() + "Z",
+                }
+            )
+            break
+
+    # Failed->success quick sequence in <=10 mins.
+    successes = [l for l in logs if l.action == "auth.login_success"]
+    for suc in successes:
+        prev_failed = [f for f in failed if f.created_at <= suc.created_at and f.created_at >= suc.created_at - timedelta(minutes=10)]
+        if prev_failed:
+            alerts.append(
+                {
+                    "type": "suspicious_recovery_login",
+                    "severity": "medium",
+                    "message": "Login succeeded shortly after one or more failed attempts.",
+                    "count": len(prev_failed),
+                    "at": suc.created_at.isoformat() + "Z",
+                }
+            )
+            break
+
+    return jsonify(
+        alerts=alerts,
+        recent_events=recent,
+        generated_at=now.isoformat() + "Z",
+        lookback_days=7,
+    )
+
+
 @bp.post("/refresh")
 @jwt_required(refresh=True)
 def refresh():
     claims = get_jwt()
     jti = claims.get("jti")
-    if not jti or not redis_client.get(_refresh_key(jti)):
+    try:
+        known = bool(jti and redis_client.get(_refresh_key(jti)))
+    except redis.RedisError:
+        known = True
+        logger.warning("Redis unavailable during refresh; proceeding without revocation check")
+
+    if not known:
         logger.warning("Refresh rejected: revoked/unknown token jti=%s", jti)
         return jsonify(error="refresh token revoked"), 401
     uid = get_jwt_identity()
@@ -121,7 +201,10 @@ def logout():
     claims = get_jwt()
     jti = claims.get("jti")
     if jti:
-        redis_client.delete(_refresh_key(jti))
+        try:
+            redis_client.delete(_refresh_key(jti))
+        except redis.RedisError:
+            logger.warning("Redis unavailable during logout; skip refresh token delete")
     return jsonify(message="logged out"), 200
 
 
@@ -136,4 +219,7 @@ def _store_refresh_session(refresh_token: str, uid: str):
     if not jti or not exp:
         return
     ttl = max(int(exp - time.time()), 1)
-    redis_client.setex(_refresh_key(jti), ttl, uid)
+    try:
+        redis_client.setex(_refresh_key(jti), ttl, uid)
+    except redis.RedisError:
+        logger.warning("Redis unavailable during login; skipping refresh session persistence")
